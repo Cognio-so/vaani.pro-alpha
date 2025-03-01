@@ -1,6 +1,8 @@
 import streamlit as st
 import asyncio
 import os
+import requests
+from io import BytesIO
 from dotenv import load_dotenv
 import logging
 import uuid
@@ -12,6 +14,11 @@ import agent
 
 # Load environment variables
 load_dotenv()
+
+# Set Replicate API token - using the exact environment variable name expected by the library
+api_key = os.getenv("REPLICATE_API_KEY")
+if api_key:
+    os.environ["REPLICATE_API_TOKEN"] = api_key
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -103,6 +110,17 @@ st.title("Cognio Agent Chat")
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+        # If this message contains an image, display it
+        if message["role"] == "assistant" and "image_url" in message:
+            try:
+                image_url = message["image_url"]
+                image_response = requests.get(image_url)
+                image_response.raise_for_status()
+                image_bytes = BytesIO(image_response.content)
+                st.image(image_bytes, caption="Generated Image", use_column_width=True)
+            except Exception as e:
+                logger.error(f"Error displaying image in history: {e}")
+                st.error(f"Could not display the image. You can view it at: {image_url}")
 
 # Function to process messages through the agent
 async def process_message(user_input):
@@ -142,6 +160,7 @@ async def process_message(user_input):
         
         # Extract the response and update summary if provided
         response_content = "I couldn't process your request. Please try again."
+        image_url = None
         
         # Completely rewritten response extraction logic
         if "messages" in result:
@@ -157,6 +176,12 @@ async def process_message(user_input):
                     # Handle different content formats
                     if isinstance(content, str):
                         response_content = content
+                        # Check if this is an image generation response
+                        if "Generated image:" in response_content:
+                            # Extract the image URL
+                            image_url = response_content.split("Generated image:")[1].strip()
+                            # Update the response to indicate we'll display the image
+                            response_content = "Here's the generated image:"
                     elif isinstance(content, list):
                         # For structured content (like from Claude)
                         text_parts = []
@@ -182,13 +207,13 @@ async def process_message(user_input):
                         if q:
                             response_content += f"- {q}\n"
         
-        return response_content
+        return response_content, image_url
         
     except Exception as e:
         logger.error(f"Error processing message: {e}")
         import traceback
         logger.error(traceback.format_exc())  # Log the full traceback for debugging
-        return f"An error occurred: {str(e)}"
+        return f"An error occurred: {str(e)}", None
 
 # User input
 user_input = st.chat_input("Ask me anything...")
@@ -206,14 +231,33 @@ if user_input:
         thinking_placeholder.markdown("🧠 Thinking...")
         
         # Process the message
-        response = asyncio.run(process_message(user_input))
+        response, image_url = asyncio.run(process_message(user_input))
         
         # Replace thinking indicator with response
         thinking_placeholder.empty()
         st.markdown(response)
-    
-    # Add assistant response to chat history
-    st.session_state.messages.append({"role": "assistant", "content": response})
+        
+        # If there's an image URL, download and display it
+        if image_url:
+            try:
+                # Download the image
+                image_response = requests.get(image_url)
+                image_response.raise_for_status()  # Raise an exception for HTTP errors
+                
+                # Display the image
+                image_bytes = BytesIO(image_response.content)
+                st.image(image_bytes, caption="Generated Image", use_column_width=True)
+                
+                # Store both text and image URL in session state
+                response_with_url = f"{response}\n\n[Image URL]({image_url})"
+                st.session_state.messages.append({"role": "assistant", "content": response_with_url, "image_url": image_url})
+            except Exception as e:
+                logger.error(f"Error displaying image: {e}")
+                st.error(f"Could not display the image. You can view it at: {image_url}")
+                st.session_state.messages.append({"role": "assistant", "content": f"{response}\n\nImage URL: {image_url}"})
+        else:
+            # Add assistant response to chat history (text only)
+            st.session_state.messages.append({"role": "assistant", "content": response})
 
 # Display current agent state in an expander (for debugging)
 with st.expander("Debug Information", expanded=False):

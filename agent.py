@@ -14,8 +14,10 @@ from typing import TypedDict, Annotated, Sequence
 # Load environment variables
 load_dotenv()
 
-# Set Replicate API token explicitly
-os.environ["REPLICATE_API_TOKEN"] = os.getenv("REPLICATE_API_KEY")
+# Set Replicate API token - using the exact environment variable name expected by the library
+api_key = os.getenv("REPLICATE_API_KEY")
+if api_key:
+    os.environ["REPLICATE_API_TOKEN"] = api_key
 
 # --- Logging Setup ---
 # Configures logging to capture info and error messages for debugging and monitoring
@@ -101,23 +103,27 @@ async def image_generator_node(state: VaaniState) -> VaaniState:
     user_query = validate_user_input(state["messages"][-1].content)
     try:
         # Log the API key status (without revealing the full key)
-        api_key = os.getenv("REPLICATE_API_KEY")
-        if not api_key:
-            logger.error("REPLICATE_API_KEY is not set in environment variables")
-            return {"messages": [AIMessage(content="Error: Replicate API key is not configured properly. Please check your environment variables.")]}
+        api_token = os.environ.get("REPLICATE_API_TOKEN")
+        if not api_token:
+            logger.error("REPLICATE_API_TOKEN is not set in environment variables")
+            return {"messages": [AIMessage(content="Error: Replicate API token is not configured properly. Please check your environment variables.")]}
         
         # Log that we're about to make the API call
         logger.info(f"Making Replicate API call with prompt: {user_query[:50]}...")
         
+        # Use the exact format from the reference implementation
         input = {"prompt": user_query}
+        
         # Run Replicate API call in a thread to avoid blocking the event loop
         output = await asyncio.to_thread(replicate.run, "black-forest-labs/flux-schnell", input=input)
         
         if not output:
             logger.warning("Replicate API returned empty output")
             return {"messages": [AIMessage(content="The image generation service returned an empty response. Please try again with a different prompt.")]}
-            
-        response = f"Generated image: {output}"
+        
+        # Format the output URL
+        image_url = output[0] if isinstance(output, list) else output
+        response = f"Generated image: {image_url}"
         logger.info("Successfully generated image")
     except Exception as e:
         import traceback
