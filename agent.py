@@ -2,12 +2,20 @@ import asyncio
 import logging
 from tenacity import retry, stop_after_attempt, wait_exponential
 import replicate
+import os
+from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, RemoveMessage
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langgraph.graph import StateGraph, END, START
 from langgraph.checkpoint.memory import MemorySaver
 from typing import TypedDict, Annotated, Sequence
+
+# Load environment variables
+load_dotenv()
+
+# Set Replicate API token explicitly
+os.environ["REPLICATE_API_TOKEN"] = os.getenv("REPLICATE_API_KEY")
 
 # --- Logging Setup ---
 # Configures logging to capture info and error messages for debugging and monitoring
@@ -92,13 +100,36 @@ async def image_generator_node(state: VaaniState) -> VaaniState:
     """Generates an image based on the user's query with retry logic for API failures."""
     user_query = validate_user_input(state["messages"][-1].content)
     try:
+        # Log the API key status (without revealing the full key)
+        api_key = os.getenv("REPLICATE_API_KEY")
+        if not api_key:
+            logger.error("REPLICATE_API_KEY is not set in environment variables")
+            return {"messages": [AIMessage(content="Error: Replicate API key is not configured properly. Please check your environment variables.")]}
+        
+        # Log that we're about to make the API call
+        logger.info(f"Making Replicate API call with prompt: {user_query[:50]}...")
+        
         input = {"prompt": user_query}
         # Run Replicate API call in a thread to avoid blocking the event loop
         output = await asyncio.to_thread(replicate.run, "black-forest-labs/flux-schnell", input=input)
+        
+        if not output:
+            logger.warning("Replicate API returned empty output")
+            return {"messages": [AIMessage(content="The image generation service returned an empty response. Please try again with a different prompt.")]}
+            
         response = f"Generated image: {output}"
+        logger.info("Successfully generated image")
     except Exception as e:
+        import traceback
         logger.error(f"Error generating image: {e}")
-        response = f"Error generating image: {str(e)}"
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        
+        # Provide a more helpful error message based on the exception
+        if "401" in str(e) or "Unauthenticated" in str(e):
+            response = "Error: Authentication failed with Replicate. Please check your API key configuration."
+        else:
+            response = f"Error generating image: {str(e)}"
+            
     return {"messages": [AIMessage(content=response)]}  # Return as a list containing one AIMessage
 
 async def rag_agent_node(state: VaaniState) -> VaaniState:
