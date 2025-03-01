@@ -52,4 +52,7 @@ __pycache__/
 .Python
 env/
 venv/
-ENV/ 
+ENV/
+
+# Replit specific
+.pythonlibs/ 
