@@ -1,13 +1,12 @@
 import asyncio
 import logging
-import sqlite3
 from tenacity import retry, stop_after_attempt, wait_exponential
 import replicate
 from langchain_groq import ChatGroq
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, RemoveMessage
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langgraph.graph import StateGraph, END, START
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.memory import MemorySaver
 from typing import TypedDict, Annotated, Sequence
 
 # --- Logging Setup ---
@@ -37,10 +36,9 @@ def authenticate_user(token: str) -> bool:
     """Checks user token validity. Replace with actual authentication logic (e.g., JWT)."""
     return token == "valid_token"  # Simplified example for demonstration
 
-# --- Checkpointing with SQLite ---
-# Sets up SQLite for state persistence with autocommit and thread safety
-conn = sqlite3.connect("vaani_state.db", check_same_thread=False, isolation_level=None)
-memory = SqliteSaver(conn)
+# --- Checkpointing with Memory Saver ---
+# Sets up memory saver for state persistence instead of SQLite
+memory = MemorySaver()
 
 # --- System Prompt for Orchestrator ---
 # Defines the logic for routing queries to appropriate agents
@@ -101,7 +99,7 @@ async def image_generator_node(state: VaaniState) -> VaaniState:
     except Exception as e:
         logger.error(f"Error generating image: {e}")
         response = f"Error generating image: {str(e)}"
-    return {"messages": AIMessage(content=response)}  # Return as AIMessage for consistency
+    return {"messages": [AIMessage(content=response)]}  # Return as a list containing one AIMessage
 
 async def rag_agent_node(state: VaaniState) -> VaaniState:
     """Processes file-based queries using aRetrieval-Augmented Generation (RAG) approach."""
@@ -116,19 +114,53 @@ async def rag_agent_node(state: VaaniState) -> VaaniState:
     # 5. Query Qdrant with user_query
     # 6. Generate response from retrieved chunks
     response = f"Response based on file at {file_url}: [Placeholder]"
-    return {"messages": AIMessage(content=response)}  # Return as AIMessage
+    return {"messages": [AIMessage(content=response)]}  # Return as a list containing one AIMessage
 
 async def web_search_agent_node(state: VaaniState) -> VaaniState:
-    """Performs a web search using Tavily based on the user's query."""
-    user_query = validate_user_input(state["messages"][-1].content)
+    """Performs a web search using Tavily and processes results with an LLM to generate a coherent answer."""
+    messages = state["messages"]
+    user_query = validate_user_input(messages[-1].content)
+    
     try:
+        # Perform web search
         tool = TavilySearchResults(max_results=3)
         search_results = tool.invoke(user_query)  # Synchronous call to Tavily API
-        response = f"Web search results: {search_results}"
+        
+        # Format search results for the LLM
+        formatted_results = "Web search results:\n\n"
+        for i, result in enumerate(search_results, 1):
+            formatted_results += f"Source {i}: {result['url']}\n"
+            formatted_results += f"Content: {result['content']}\n\n"
+        
+        # Create prompt for the LLM
+        system_message = SystemMessage(content=f"""
+You are a helpful assistant that answers questions based on web search results.
+Use the provided search results to answer the user's question.
+If the search results don't contain enough information to answer the question, say so.
+Always cite your sources by referring to the source numbers.
+Be concise, accurate, and helpful.
+
+{formatted_results}
+""")
+        
+        # Get conversation history for context
+        conversation_history = messages[-5:] if len(messages) > 1 else messages
+        
+        # Add the system message at the beginning
+        prompt_messages = [system_message] + conversation_history
+        
+        # Process with LLM
+        llm = ChatGroq(model_name="llama-3.3-70b-versatile")
+        response = await llm.ainvoke(prompt_messages)
+        
+        # Return the processed response
+        return {"messages": [AIMessage(content=response.content)]}
+        
     except Exception as e:
-        logger.error(f"Error performing web search: {e}")
-        response = f"Error performing web search: {str(e)}"
-    return {"messages": AIMessage(content=response)}  # Return as AIMessage
+        logger.error(f"Error in web_search_agent_node: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {"messages": [AIMessage(content=f"I encountered an error while searching the web: {str(e)}")]}
 
 async def default_agent_node(state: VaaniState) -> VaaniState:
     """Handles general queries with conversation context and summary."""
@@ -140,10 +172,13 @@ async def default_agent_node(state: VaaniState) -> VaaniState:
     llm = ChatGroq(model_name="llama-3.3-70b-versatile")  # Versatile model for general queries
     try:
         response = await llm.ainvoke(messages)
-        return {"messages": AIMessage(content=response.content)}
+        # Create a new AIMessage with the response content
+        ai_message = AIMessage(content=response.content)
+        # Return a dictionary with the messages key containing the AIMessage
+        return {"messages": [ai_message]}
     except Exception as e:
         logger.error(f"Error in default_agent_node: {e}")
-        return {"messages": AIMessage(content="Error processing your request")}
+        return {"messages": [AIMessage(content="Error processing your request")]}
 
 async def summarize_node(state: VaaniState) -> VaaniState:
     """Summarizes the conversation and keeps only the last 4 messages."""
@@ -241,3 +276,6 @@ async def run_example():
 
 if __name__ == "__main__":
     asyncio.run(run_example())
+
+# Export the graph and VaaniState for use in other modules
+__all__ = ["graph", "VaaniState"]
