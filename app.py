@@ -52,6 +52,43 @@ st.markdown("""
     .stButton button {
         width: 100%;
     }
+    /* Source citation styles */
+    .source-citations {
+        display: flex;
+        gap: 8px;
+        margin-top: 10px;
+    }
+    .source-link {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        border-radius: 50%;
+        background-color: #f0f2f6;
+        color: #0e1117;
+        font-size: 12px;
+        font-weight: bold;
+        text-decoration: none;
+        border: 1px solid #d1d5db;
+    }
+    .source-link:hover {
+        background-color: #d1d5db;
+    }
+    /* Clickable follow-up question styles */
+    .follow-up-question {
+        display: inline-block;
+        padding: 6px 12px;
+        margin: 4px 0;
+        background-color: #f0f2f6;
+        border-radius: 16px;
+        cursor: pointer;
+        border: 1px solid #d1d5db;
+        font-size: 14px;
+    }
+    .follow-up-question:hover {
+        background-color: #d1d5db;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -161,6 +198,7 @@ async def process_message(user_input):
         # Extract the response and update summary if provided
         response_content = "I couldn't process your request. Please try again."
         image_url = None
+        sources = []
         
         # Completely rewritten response extraction logic
         if "messages" in result:
@@ -176,6 +214,16 @@ async def process_message(user_input):
                     # Handle different content formats
                     if isinstance(content, str):
                         response_content = content
+                        
+                        # Extract sources if they exist in the format [Source X: URL]
+                        import re
+                        source_matches = re.findall(r'\[Source (\d+): ([^\]]+)\]', response_content)
+                        for num, url in source_matches:
+                            sources.append({"num": num, "url": url})
+                        
+                        # Remove source citations from the main text
+                        response_content = re.sub(r'\[Source \d+: [^\]]+\]', '', response_content)
+                        
                         # Check if this is an image generation response
                         if "Generated image:" in response_content:
                             # Extract the image URL
@@ -196,18 +244,31 @@ async def process_message(user_input):
             st.session_state.conversation_summary = result["summary"]
         
         # Handle extra questions if provided
+        extra_questions = []
         if "extra_question" in result and result["extra_question"]:
             extra_question = result["extra_question"]
             if isinstance(extra_question, str):
-                extra_questions = extra_question.split("\n")
-                if extra_questions:
-                    response_content += "\n\n**Follow-up questions you might consider:**\n"
-                    for q in extra_questions[:3]:  # Limit to 3 suggestions
-                        q = q.strip().strip('-').strip()
-                        if q:
-                            response_content += f"- {q}\n"
+                extra_questions = [q.strip().strip('-').strip() for q in extra_question.split("\n")]
+                extra_questions = [q for q in extra_questions if q]  # Remove empty questions
         
-        return response_content, image_url
+        # Format the response with source citations and follow-up questions
+        formatted_response = response_content
+        
+        # Add source citations HTML if sources exist
+        if sources:
+            source_html = '<div class="source-citations">'
+            for source in sources:
+                source_html += f'<a href="{source["url"]}" target="_blank" class="source-link">{source["num"]}</a>'
+            source_html += '</div>'
+            formatted_response += source_html
+        
+        # Add follow-up questions HTML if they exist
+        if extra_questions:
+            formatted_response += "\n\n**Follow-up questions you might consider:**\n"
+            for i, q in enumerate(extra_questions[:3]):  # Limit to 3 suggestions
+                formatted_response += f'<div class="follow-up-question" onclick="parent.postMessage({{question: \'{q}\'}}, \'*\')">{q}</div>\n'
+        
+        return formatted_response, image_url
         
     except Exception as e:
         logger.error(f"Error processing message: {e}")
@@ -235,7 +296,7 @@ if user_input:
         
         # Replace thinking indicator with response
         thinking_placeholder.empty()
-        st.markdown(response)
+        st.markdown(response, unsafe_allow_html=True)
         
         # If there's an image URL, download and display it
         if image_url:
@@ -268,4 +329,27 @@ with st.expander("Debug Information", expanded=False):
     
     if st.session_state.conversation_summary:
         st.subheader("Current Conversation Summary")
-        st.info(st.session_state.conversation_summary) 
+        st.info(st.session_state.conversation_summary)
+
+# Add JavaScript to handle clickable follow-up questions
+st.markdown("""
+<script>
+window.addEventListener('message', function(e) {
+    if (e.data.question) {
+        // Find the chat input and set its value
+        const chatInput = document.querySelector('.stChatInputContainer input');
+        if (chatInput) {
+            chatInput.value = e.data.question;
+            // Trigger the Enter key to submit
+            chatInput.dispatchEvent(new KeyboardEvent('keydown', {
+                key: 'Enter',
+                code: 'Enter',
+                keyCode: 13,
+                which: 13,
+                bubbles: true
+            }));
+        }
+    }
+});
+</script>
+""", unsafe_allow_html=True) 

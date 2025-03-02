@@ -16,6 +16,10 @@ langgraph = "^0.3.2"
 replicate = "^1.0.4"
 python-dotenv = "^1.0.1"
 tenacity = "^9.0.0"
+pymongo = "^4.11.1"
+langchain-core = "^0.3.40"
+langgraph-checkpoint = "^2.0.16"
+requests = "^2.32.3"
 
 
 [build-system]
