@@ -65,13 +65,30 @@ Output only the name of the agent to route to.
 # --- Node Functions ---
 
 async def extra_questions_node(state: VaaniState) -> VaaniState:
-    """Generates additional questions based on the user's last message."""
-    last_message = state["messages"][-1]
-    if last_message.type == "human":
+    """Generates additional questions based on the user's last message and conversation context."""
+    messages = state["messages"]
+    summary = state.get("summary", "")
+    
+    # Get the last message (which should be the user's query)
+    last_message = messages[-1] if messages else None
+    if last_message and last_message.type == "human":
         user_input = validate_user_input(last_message.content)
+        
+        # Create a prompt that includes conversation context
+        context_prompt = f"Conversation summary: {summary}\n\n" if summary else ""
+        
+        # Add the last few messages for immediate context
+        if len(messages) > 1:
+            context_prompt += "Recent conversation:\n"
+            for i, msg in enumerate(messages[-5:-1]):  # Skip the last message as we'll add it separately
+                prefix = "User: " if msg.type == "human" else "Assistant: "
+                context_prompt += f"{prefix}{msg.content}\n"
+        
+        prompt = f"{context_prompt}\nBased on this conversation context and the user's latest question: '{user_input}', generate 3 relevant follow-up questions."
+        
         llm = ChatGroq(model_name="Llama-3.1-8b-instant")  # Lightweight model for quick responses
         try:
-            response = await llm.ainvoke(f"Generate additional questions based on: {user_input}")
+            response = await llm.ainvoke(prompt)
             return {"extra_question": response.content}
         except Exception as e:
             logger.error(f"Error in extra_questions_node: {e}")
@@ -100,7 +117,42 @@ async def orchestrator_node(state: VaaniState) -> VaaniState:
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 async def image_generator_node(state: VaaniState) -> VaaniState:
     """Generates an image based on the user's query with retry logic for API failures."""
-    user_query = validate_user_input(state["messages"][-1].content)
+    messages = state["messages"]
+    summary = state.get("summary", "")
+    user_query = validate_user_input(messages[-1].content if messages else "")
+    
+    # Enhance the prompt with conversation context if available
+    if summary or len(messages) > 1:
+        # Create a context-aware prompt for image generation
+        llm = ChatGroq(model_name="Llama-3.1-8b-instant")
+        
+        context_prompt = f"""
+Based on the following conversation context, create a detailed image generation prompt that captures what the user is asking for.
+
+Conversation summary: {summary}
+
+Recent messages:
+"""
+        
+        # Add the last few messages for immediate context
+        for i, msg in enumerate(messages[-3:]):
+            prefix = "User: " if msg.type == "human" else "Assistant: "
+            context_prompt += f"{prefix}{msg.content}\n"
+            
+        context_prompt += "\nCreate a detailed image generation prompt based on this context:"
+        
+        try:
+            # Get an enhanced prompt from the LLM
+            response = await llm.ainvoke(context_prompt)
+            enhanced_query = response.content
+            logger.info(f"Enhanced image prompt: {enhanced_query[:100]}...")
+            # Use the enhanced query if it's not empty
+            if enhanced_query and len(enhanced_query) > 10:
+                user_query = enhanced_query
+        except Exception as e:
+            logger.error(f"Error enhancing image prompt: {e}")
+            # Continue with original query if enhancement fails
+    
     try:
         # Log the API key status (without revealing the full key)
         api_token = os.environ.get("REPLICATE_API_TOKEN")
@@ -136,12 +188,26 @@ async def image_generator_node(state: VaaniState) -> VaaniState:
         else:
             response = f"Error generating image: {str(e)}"
             
-    return {"messages": [AIMessage(content=response)]}  # Return as a list containing one AIMessage
+    return {"messages": [AIMessage(content=response)]}
 
 async def rag_agent_node(state: VaaniState) -> VaaniState:
-    """Processes file-based queries using aRetrieval-Augmented Generation (RAG) approach."""
+    """Processes file-based queries using a Retrieval-Augmented Generation (RAG) approach."""
     file_url = state["file_url"]
-    user_query = validate_user_input(state["messages"][-1].content)
+    messages = state["messages"]
+    summary = state.get("summary", "")
+    user_query = validate_user_input(messages[-1].content if messages else "")
+    
+    # Create a context-aware prompt that includes conversation history
+    context_prompt = f"""
+You are a helpful assistant that answers questions based on document content and conversation context.
+
+Conversation summary: {summary}
+
+Document: {file_url}
+
+Please provide a detailed response to the user's query based on both the document content and the conversation context.
+"""
+    
     # Placeholder for actual RAG implementation
     # Steps would include:
     # 1. Parse file at file_url (e.g., PyPDF2 for PDFs)
@@ -150,69 +216,136 @@ async def rag_agent_node(state: VaaniState) -> VaaniState:
     # 4. Store in Qdrant vector DB
     # 5. Query Qdrant with user_query
     # 6. Generate response from retrieved chunks
-    response = f"Response based on file at {file_url}: [Placeholder]"
-    return {"messages": [AIMessage(content=response)]}  # Return as a list containing one AIMessage
+    
+    # For now, we'll just return a placeholder response that acknowledges the conversation context
+    response = f"Response based on file at {file_url} and conversation context: [Placeholder]"
+    
+    # In a real implementation, we would:
+    # 1. Retrieve relevant chunks based on user_query
+    # 2. Pass those chunks, along with conversation context, to an LLM
+    # 3. Generate a response that incorporates both the document content and conversation context
+    
+    return {"messages": [AIMessage(content=response)]}
 
 async def web_search_agent_node(state: VaaniState) -> VaaniState:
-    """Performs a web search using Tavily and processes results with an LLM to generate a coherent answer."""
+    """Performs a web search based on the user's query and returns the results."""
     messages = state["messages"]
-    user_query = validate_user_input(messages[-1].content)
+    summary = state.get("summary", "")
+    
+    # Get the last message (user's query)
+    last_message = messages[-1]
+    if not isinstance(last_message, HumanMessage):
+        logger.error("Last message is not a HumanMessage")
+        return {"messages": [AIMessage(content="I encountered an error processing your request.")]}
+    
+    user_input = last_message.content
+    
+    # Extract recent conversation context (last 2 exchanges)
+    recent_messages = messages[-min(4, len(messages)):]
+    recent_context = "\n".join([f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {m.content}" for m in recent_messages[:-1]])
     
     try:
-        # Perform web search
+        # Create a search query that considers conversation context
+        search_query_prompt = f"""
+Based on the following conversation context and the user's latest query, generate a focused web search query.
+
+Conversation Summary: {summary}
+
+Recent Messages:
+{recent_context}
+
+User's Latest Query: {user_input}
+
+Generate a concise search query that will find the most relevant information to answer the user's latest query.
+"""
+        
+        # Use a lightweight model to generate the search query
+        llm = ChatGroq(model_name="Llama-3.1-8b-instant")
+        search_query_response = await llm.ainvoke([HumanMessage(content=search_query_prompt)])
+        search_query = search_query_response.content.strip()
+        
+        logger.info(f"Generated search query: {search_query}")
+        
+        # Perform the web search using TavilySearchResults
         tool = TavilySearchResults(max_results=3)
-        search_results = tool.invoke(user_query)  # Synchronous call to Tavily API
+        search_results = tool.invoke(search_query)  # Synchronous call to Tavily API
         
-        # Format search results for the LLM
-        formatted_results = "Web search results:\n\n"
+        if not search_results:
+            return {"messages": [AIMessage(content="I couldn't find any relevant information on the web for your query.")]}
+        
+        # Format the search results for the LLM
+        formatted_results = []
         for i, result in enumerate(search_results, 1):
-            formatted_results += f"Source {i}: {result['url']}\n"
-            formatted_results += f"Content: {result['content']}\n\n"
+            title = result.get("title", "No title")
+            content = result.get("content", "No content available")
+            url = result.get("url", "#")
+            formatted_results.append(f"Result {i}:\nTitle: {title}\nContent: {content}\nURL: {url}\n")
         
-        # Create prompt for the LLM
-        system_message = SystemMessage(content=f"""
-You are a helpful assistant that answers questions based on web search results.
-Use the provided search results to answer the user's question.
-If the search results don't contain enough information to answer the question, say so.
+        search_results_text = "\n".join(formatted_results)
+        
+        # Create a system message that instructs the LLM on how to format the response
+        system_message = """You are a helpful AI assistant that provides information based on web search results.
 
-IMPORTANT: When citing sources, use the format [Source X: URL] where X is the source number and URL is the full URL.
-For example: [Source 1: https://example.com]
-Place these citations at the end of your response, not inline with the text.
+IMPORTANT FORMATTING INSTRUCTIONS:
+1. Analyze the search results and provide a comprehensive answer to the user's query.
+2. DO NOT mention that you performed a web search unless specifically asked.
+3. DO NOT include the URLs inline in your response.
+4. At the end of your response, include source citations in the following format:
+   [Source 1: URL1]
+   [Source 2: URL2]
+   etc.
+5. Make sure your response is well-structured, accurate, and directly addresses the user's query.
+6. Consider the conversation context when formulating your response.
+"""
+        
+        # Create a prompt that includes the conversation context
+        context_prompt = f"""
+Conversation Summary: {summary}
 
-Be concise, accurate, and helpful.
+Recent Messages:
+{recent_context}
 
-{formatted_results}
-""")
+User's Latest Query: {user_input}
+
+Based on the following web search results, please provide a comprehensive answer:
+
+{search_results_text}
+"""
         
-        # Get conversation history for context
-        conversation_history = messages[-5:] if len(messages) > 1 else messages
+        # Use a more powerful model for generating the final response
+        response_llm = ChatGroq(model_name="Llama-3.3-70b-versatile")
+        response = await response_llm.ainvoke([
+            SystemMessage(content=system_message),
+            HumanMessage(content=context_prompt)
+        ])
         
-        # Add the system message at the beginning
-        prompt_messages = [system_message] + conversation_history
-        
-        # Process with LLM
-        llm = ChatGroq(model_name="llama-3.3-70b-versatile")
-        response = await llm.ainvoke(prompt_messages)
-        
-        # Return the processed response
         return {"messages": [AIMessage(content=response.content)]}
-        
     except Exception as e:
         logger.error(f"Error in web_search_agent_node: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        return {"messages": [AIMessage(content=f"I encountered an error while searching the web: {str(e)}")]}
+        return {"messages": [AIMessage(content="I encountered an error while searching the web. Please try again later.")]}
 
 async def default_agent_node(state: VaaniState) -> VaaniState:
     """Handles general queries with conversation context and summary."""
     messages = state["messages"]
     summary = state.get("summary", "")
-    # Prepend summary as a system message if it exists
-    if summary:
-        messages = [SystemMessage(content=f"Summary: {summary}")] + messages
+    
+    # Create a system message with conversation context
+    context_message = SystemMessage(content=f"""
+You are a helpful AI assistant. Respond to the user's query based on the conversation context.
+
+Conversation summary: {summary}
+
+Remember to maintain continuity with the previous conversation and provide relevant, helpful responses.
+""")
+    
+    # Combine context message with all conversation messages
+    prompt_messages = [context_message] + messages
+    
     llm = ChatGroq(model_name="llama-3.3-70b-versatile")  # Versatile model for general queries
     try:
-        response = await llm.ainvoke(messages)
+        response = await llm.ainvoke(prompt_messages)
         # Create a new AIMessage with the response content
         ai_message = AIMessage(content=response.content)
         # Return a dictionary with the messages key containing the AIMessage
@@ -225,12 +358,34 @@ async def summarize_node(state: VaaniState) -> VaaniState:
     """Summarizes the conversation and keeps only the last 4 messages."""
     messages = state["messages"]
     summary = state.get("summary", "")
-    summary_message = f"Summary so far: {summary}\nExtend with new messages:" if summary else "Summarize the conversation:"
-    llm = ChatGroq(model_name="Llama-3.1-8b-instant")  # Placeholder until Gemini 2.0 Flash is integrated
+    
+    # Create a prompt that asks for a comprehensive summary
+    summary_prompt = f"""
+You are tasked with creating a concise but comprehensive summary of the conversation so far.
+
+Current summary: {summary}
+
+Please update the summary to include the key points from the recent messages. 
+The summary should capture:
+1. Main topics discussed
+2. Important information shared
+3. Questions asked and answers provided
+4. Any decisions or conclusions reached
+
+Your summary will be used to provide context for future responses, so make sure it captures all relevant information.
+"""
+    
+    llm = ChatGroq(model_name="Llama-3.1-8b-instant")  # Lightweight model for summarization
     try:
-        response = await llm.ainvoke(messages + [HumanMessage(content=summary_message)])
+        # Add the summary prompt as a human message
+        prompt_messages = messages + [HumanMessage(content=summary_prompt)]
+        response = await llm.ainvoke(prompt_messages)
+        
         # Remove all but the last 4 messages to manage state size
+        # This ensures we keep the last 2 full exchanges (user + assistant)
         delete_messages = [RemoveMessage(id=m.id) for m in messages[:-4]]
+        
+        logger.info(f"Updated summary: {response.content[:100]}...")
         return {"summary": response.content, "messages": delete_messages}
     except Exception as e:
         logger.error(f"Error in summarize_node: {e}")

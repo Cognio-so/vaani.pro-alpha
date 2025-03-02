@@ -85,9 +85,22 @@ st.markdown("""
         cursor: pointer;
         border: 1px solid #d1d5db;
         font-size: 14px;
+        transition: background-color 0.2s;
+        position: relative;
     }
     .follow-up-question:hover {
         background-color: #d1d5db;
+    }
+    /* Allow markdown rendering in follow-up questions */
+    .follow-up-question p {
+        margin: 0;
+        padding: 0;
+    }
+    .follow-up-question em, 
+    .follow-up-question strong, 
+    .follow-up-question code,
+    .follow-up-question a {
+        display: inline;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -104,6 +117,9 @@ if "file_url" not in st.session_state:
 
 if "conversation_summary" not in st.session_state:
     st.session_state.conversation_summary = ""
+
+if "follow_up_question" not in st.session_state:
+    st.session_state.follow_up_question = ""
 
 # Sidebar for configuration
 with st.sidebar:
@@ -154,7 +170,7 @@ for message in st.session_state.messages:
                 image_response = requests.get(image_url)
                 image_response.raise_for_status()
                 image_bytes = BytesIO(image_response.content)
-                st.image(image_bytes, caption="Generated Image", use_column_width=True)
+                st.image(image_bytes, caption="Generated Image", use_container_width=True)
             except Exception as e:
                 logger.error(f"Error displaying image in history: {e}")
                 st.error(f"Could not display the image. You can view it at: {image_url}")
@@ -169,8 +185,12 @@ async def process_message(user_input):
         if st.session_state.conversation_summary:
             langchain_messages.append(SystemMessage(content=f"Conversation summary: {st.session_state.conversation_summary}"))
         
-        # Add recent conversation history (last 5 messages)
-        for msg in st.session_state.messages[-5:]:
+        # Get the last 4 messages (2 full exchanges: user + assistant, user + assistant)
+        # This ensures we have the last 2 full exchanges (2 questions and 2 answers)
+        recent_messages = st.session_state.messages[-4:] if len(st.session_state.messages) >= 4 else st.session_state.messages
+        
+        # Add recent conversation history
+        for msg in recent_messages:
             if msg["role"] == "user":
                 langchain_messages.append(HumanMessage(content=msg["content"]))
             else:
@@ -178,6 +198,11 @@ async def process_message(user_input):
         
         # Add the current user message
         langchain_messages.append(HumanMessage(content=user_input))
+        
+        # Log the context being sent to the agent
+        logger.info(f"Sending context with {len(langchain_messages)} messages to agent")
+        if st.session_state.conversation_summary:
+            logger.info(f"Summary included: {st.session_state.conversation_summary[:100]}...")
         
         # Prepare state for agent
         state = {
@@ -266,7 +291,20 @@ async def process_message(user_input):
         if extra_questions:
             formatted_response += "\n\n**Follow-up questions you might consider:**\n"
             for i, q in enumerate(extra_questions[:3]):  # Limit to 3 suggestions
-                formatted_response += f'<div class="follow-up-question" onclick="parent.postMessage({{question: \'{q}\'}}, \'*\')">{q}</div>\n'
+                # Create a unique key for this question
+                question_key = f"follow_up_{i}"
+                # Convert markdown to HTML for the display
+                import markdown
+                html_q = markdown.markdown(q)
+                # Add both client-side and server-side handling
+                formatted_response += f"""
+<div class="follow-up-question" 
+     data-question="{q.replace('"', '&quot;')}" 
+     onclick="handleFollowUpQuestion(this)" 
+     data-key="{question_key}">
+    {html_q}
+</div>
+"""
         
         return formatted_response, image_url
         
@@ -276,8 +314,18 @@ async def process_message(user_input):
         logger.error(traceback.format_exc())  # Log the full traceback for debugging
         return f"An error occurred: {str(e)}", None
 
+# Function to handle follow-up question clicks
+def handle_follow_up_click(question):
+    st.session_state.follow_up_question = question
+    st.rerun()
+
 # User input
 user_input = st.chat_input("Ask me anything...")
+
+# Check if we have a follow-up question to process
+if st.session_state.follow_up_question:
+    user_input = st.session_state.follow_up_question
+    st.session_state.follow_up_question = ""  # Clear it after use
 
 # Process user input
 if user_input:
@@ -307,7 +355,7 @@ if user_input:
                 
                 # Display the image
                 image_bytes = BytesIO(image_response.content)
-                st.image(image_bytes, caption="Generated Image", use_column_width=True)
+                st.image(image_bytes, caption="Generated Image", use_container_width=True)
                 
                 # Store both text and image URL in session state
                 response_with_url = f"{response}\n\n[Image URL]({image_url})"
@@ -334,21 +382,70 @@ with st.expander("Debug Information", expanded=False):
 # Add JavaScript to handle clickable follow-up questions
 st.markdown("""
 <script>
-window.addEventListener('message', function(e) {
-    if (e.data.question) {
-        // Find the chat input and set its value
+// Function to handle follow-up question clicks
+function handleFollowUpQuestion(element) {
+    const question = element.getAttribute('data-question');
+    if (question) {
+        // Try to find the chat input and set its value
         const chatInput = document.querySelector('.stChatInputContainer input');
         if (chatInput) {
-            chatInput.value = e.data.question;
-            // Trigger the Enter key to submit
-            chatInput.dispatchEvent(new KeyboardEvent('keydown', {
-                key: 'Enter',
-                code: 'Enter',
-                keyCode: 13,
-                which: 13,
-                bubbles: true
-            }));
+            chatInput.value = question;
+            // Focus the input
+            chatInput.focus();
+            // Submit the form
+            const form = chatInput.closest('form');
+            if (form) {
+                form.dispatchEvent(new Event('submit', { bubbles: true }));
+            } else {
+                // If form not found, try to trigger Enter key
+                chatInput.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: 'Enter',
+                    code: 'Enter',
+                    keyCode: 13,
+                    which: 13,
+                    bubbles: true
+                }));
+            }
+        } else {
+            // Fallback: store in sessionStorage and reload
+            sessionStorage.setItem('followUpQuestion', question);
+            window.location.reload();
         }
+    }
+}
+
+// Check for stored question on page load
+document.addEventListener('DOMContentLoaded', function() {
+    const storedQuestion = sessionStorage.getItem('followUpQuestion');
+    if (storedQuestion) {
+        // Clear the stored question
+        sessionStorage.removeItem('followUpQuestion');
+        
+        // Find the chat input and set its value
+        setTimeout(function() {
+            const chatInput = document.querySelector('.stChatInputContainer input');
+            if (chatInput) {
+                chatInput.value = storedQuestion;
+                // Focus the input
+                chatInput.focus();
+                // Submit the form
+                setTimeout(function() {
+                    const form = chatInput.closest('form');
+                    if (form) {
+                        form.dispatchEvent(new Event('submit', { bubbles: true }));
+                    } else {
+                        // If form not found, try to trigger Enter key
+                        chatInput.dispatchEvent(new KeyboardEvent('keydown', {
+                            key: 'Enter',
+                            code: 'Enter',
+                            keyCode: 13,
+                            which: 13,
+                            bubbles: true
+                        }));
+                    }
+                }, 100);
+            }
+        }, 500);
     }
 });
 </script>
